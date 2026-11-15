@@ -212,3 +212,46 @@ func TestParseCmd(t *testing.T) {
 		}
 	}
 }
+
+func TestGetLockPath(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// With XDG_RUNTIME_DIR set
+	t.Setenv("XDG_RUNTIME_DIR", tempDir)
+	lockPath := getLockPath("/custom/config")
+	expected := tempDir + "/touchzones.lock"
+	if lockPath != expected {
+		t.Fatalf("expected %q, got %q", expected, lockPath)
+	}
+
+	// Without XDG_RUNTIME_DIR
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	customConfig := tempDir + "/cfg"
+	lockPathFallback := getLockPath(customConfig)
+	expectedFallback := customConfig + "/touchzones.lock"
+	if lockPathFallback != expectedFallback {
+		t.Fatalf("expected %q, got %q", expectedFallback, lockPathFallback)
+	}
+}
+
+func TestGetRunningPIDNotRunning(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", tempDir)
+
+	_, err := getRunningPID(tempDir)
+	if err == nil {
+		t.Fatalf("expected error when no lock file exists, got nil")
+	}
+}
+
+func TestKillRunningDaemonNotRunning(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", tempDir)
+
+	err := killDaemon(tempDir)
+	if err == nil {
+		t.Fatalf("expected error when no lock file exists, got nil")
+	}
+}
+
+

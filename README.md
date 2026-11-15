@@ -177,5 +177,7 @@ Commands:
 Options:
     -c, --config=path/to/file   Use an alternative config file.
     -d, --daemon                Daemonize the process.
+    -k, --kill-daemon           Kill running touchzones daemon.
+    -r, --reload                Reload configuration of running daemon.
     -v, --version               Shows touchzones version.
 ```

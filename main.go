@@ -18,9 +18,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
-	"time"
 
 	"github.com/holoplot/go-evdev"
 )
@@ -28,6 +28,8 @@ import (
 const version = "1.0.0"
 
 var (
+	configMu sync.RWMutex
+
 	edge             = 0.06
 	topEdge          = 0.08
 	maxTapTime       = 0.25 // seconds
@@ -116,17 +118,22 @@ func decideZone(t *Touch, maxX, maxY float64) {
 	if t.zone != ZoneUndecided || !t.hasX0 || !t.hasY0 {
 		return
 	}
+	configMu.RLock()
+	curEdge := edge
+	curTopEdge := topEdge
+	configMu.RUnlock()
+
 	fx0 := float64(t.x0)
 	fy0 := float64(t.y0)
-	if fx0 > maxX*(1.0-edge) {
+	if fx0 > maxX*(1.0-curEdge) {
 		t.zone = ZoneRight
 		t.last = fy0
 		t.hasLast = true
-	} else if fx0 < maxX*edge {
+	} else if fx0 < maxX*curEdge {
 		t.zone = ZoneLeft
 		t.last = fy0
 		t.hasLast = true
-	} else if fy0 < maxY*topEdge {
+	} else if fy0 < maxY*curTopEdge {
 		t.zone = ZoneTop
 		t.last = fx0
 		t.hasLast = true
@@ -174,73 +181,6 @@ func fileExists(path string) (bool, error) {
 		return false, nil
 	}
 	return false, err
-}
-
-func acquireLock() (*os.File, error) {
-	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
-	var lockPath string
-	if runtimeDir != "" {
-		lockPath = path.Join(runtimeDir, "touchzones.lock")
-	} else {
-		lockPath = path.Join(os.TempDir(), fmt.Sprintf("touchzones-%d.lock", os.Getuid()))
-	}
-
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("could not open lock file: %w", err)
-	}
-
-	var lockErr error
-	for range 10 {
-		lockErr = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if lockErr == nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if lockErr != nil {
-		file.Close()
-		pidB, _ := os.ReadFile(lockPath)
-		pid := strings.TrimSpace(string(pidB))
-		if pid != "" {
-			return nil, fmt.Errorf("touchzones is already running (PID %s)", pid)
-		}
-		return nil, fmt.Errorf("touchzones is already running")
-	}
-
-	_ = file.Truncate(0)
-	_, _ = file.Seek(0, 0)
-	_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
-
-	return file, nil
-}
-
-func daemonize() {
-	if os.Getenv("TOUCHZONES_DAEMON") == "1" {
-		return
-	}
-
-	var childArgs []string
-	for _, arg := range os.Args[1:] {
-		if arg != "-d" && arg != "--daemon" {
-			childArgs = append(childArgs, arg)
-		}
-	}
-
-	cmd := exec.Command(os.Args[0], childArgs...)
-	cmd.Env = append(os.Environ(), "TOUCHZONES_DAEMON=1")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("Failed to start daemon: %v\n", err)
-	}
-
-	fmt.Printf("Started touchzones in background (PID %d)\n", cmd.Process.Pid)
-	os.Exit(0)
 }
 
 func parseCmd(val string) []string {
@@ -295,19 +235,22 @@ func parseCmd(val string) []string {
 	return args
 }
 
-func loadConfig(path string) {
+func loadConfig(path string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+
 	exists, err := fileExists(path)
 	if err != nil {
-		log.Fatalf("Error while checking configuration: %v\n", err)
+		return fmt.Errorf("checking configuration: %w", err)
 	}
 	if !exists {
 		fmt.Printf("[INFO] No config file found at %s. Using built-in defaults.\n\n", path)
-		return
+		return nil
 	}
 
 	file, err := os.Open(path)
 	if err != nil {
-		log.Fatalf("Error while checking configuration: %v", err)
+		return fmt.Errorf("opening configuration: %w", err)
 	}
 	defer file.Close()
 	scn := bufio.NewScanner(file)
@@ -368,10 +311,10 @@ func loadConfig(path string) {
 			taps[5] = parseCmd(val)
 		}
 	}
-	err = scn.Err()
-	if err != nil {
-		log.Fatalf("Error while parsing configuration: %v", err)
+	if err := scn.Err(); err != nil {
+		return fmt.Errorf("parsing configuration: %w", err)
 	}
+	return nil
 }
 
 func main() {
@@ -386,7 +329,7 @@ func main() {
 		configDir = path.Join(homeDir, ".config", "touchzones")
 	}
 	configPath := path.Join(configDir, "touchzones.conf")
-	var verFlag, daemon bool
+	var verFlag, daemon, reload, killFlag bool
 	var config string
 	flag.BoolVar(&verFlag, "version", false, "")
 	flag.BoolVar(&verFlag, "v", false, "")
@@ -394,6 +337,11 @@ func main() {
 	flag.StringVar(&config, "c", configPath, "")
 	flag.BoolVar(&daemon, "daemon", false, "")
 	flag.BoolVar(&daemon, "d", false, "")
+	flag.BoolVar(&reload, "reload", false, "")
+	flag.BoolVar(&reload, "r", false, "")
+	flag.BoolVar(&killFlag, "kill-daemon", false, "")
+	flag.BoolVar(&killFlag, "kill", false, "")
+	flag.BoolVar(&killFlag, "k", false, "")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: touchzones [options] [command]\n\nCommands:\n")
 		w := tabwriter.NewWriter(os.Stderr, 0, 0, 3, ' ', 0)
@@ -401,6 +349,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(w, "    -c, --config=path/to/file\tUse an alternative config file.\n")
 		fmt.Fprintf(w, "    -d, --daemon\tDaemonize the process.\n")
+		fmt.Fprintf(w, "    -k, --kill-daemon\tKill running touchzones daemon.\n")
+		fmt.Fprintf(w, "    -r, --reload\tReload configuration of running daemon.\n")
 		fmt.Fprintf(w, "    -v, --version\tShows touchzones version.\n")
 		w.Flush()
 	}
@@ -408,6 +358,25 @@ func main() {
 
 	if verFlag {
 		fmt.Printf("Version %s\n", version)
+		os.Exit(0)
+	}
+
+	if killFlag {
+		if err := killDaemon(configDir); err != nil {
+			log.Fatalf("Error: %v\n", err)
+		}
+		os.Exit(0)
+	}
+
+	if reload {
+		pid, err := getRunningPID(configDir)
+		if err != nil {
+			log.Fatalf("Error: %v\n", err)
+		}
+		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
+			log.Fatalf("Failed to send reload signal to PID %d: %v\n", pid, err)
+		}
+		fmt.Printf("Sent reload signal to touchzones (PID %d)\n", pid)
 		os.Exit(0)
 	}
 
@@ -431,9 +400,11 @@ func main() {
 		log.Fatalf("Unknown command: %s\nRun 'touchzones --help' for usage.\n", cmd)
 	}
 
-	loadConfig(config)
+	if err := loadConfig(config); err != nil {
+		log.Fatalf("Error loading config: %v\n", err)
+	}
 
-	lockFile, err := acquireLock()
+	lockFile, err := acquireLock(configDir)
 	if err != nil {
 		log.Fatalf("Error: %v\n", err)
 	}
@@ -456,16 +427,34 @@ func main() {
 	name, _ := dev.Name()
 	fmt.Printf("Using touchpad: %s (%s), X max: %.0f, Y max: %.0f\n", name, dev.Path(), maxX, maxY)
 
-	step := maxY * stepFactor
-	stepH := maxX * stepFactor
+	var step, stepH float64
+	configMu.Lock()
+	step = maxY * stepFactor
+	stepH = maxX * stepFactor
+	configMu.Unlock()
 
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
-		<-sigChan
-		dev.Close()
-		lockFile.Close()
-		os.Exit(0)
+		for sig := range sigChan {
+			switch sig {
+			case syscall.SIGHUP:
+				log.Println("[INFO] SIGHUP received, reloading configuration...")
+				if err := loadConfig(config); err != nil {
+					log.Printf("[WARN] Failed to reload config: %v (keeping current settings)\n", err)
+					continue
+				}
+				configMu.Lock()
+				step = maxY * stepFactor
+				stepH = maxX * stepFactor
+				configMu.Unlock()
+				log.Println("[INFO] Configuration reloaded successfully")
+			case os.Interrupt, syscall.SIGTERM:
+				dev.Close()
+				lockFile.Close()
+				os.Exit(0)
+			}
+		}
 	}()
 
 	slot := int32(0)
@@ -481,6 +470,9 @@ func main() {
 	for {
 		ev, err := dev.ReadOne()
 		if err != nil {
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
 			log.Fatalf("Error reading evdev event: %v", err)
 		}
 
@@ -509,23 +501,30 @@ func main() {
 				if !ok {
 					break
 				}
+				configMu.RLock()
+				curMaxTapMove := maxTapMove
+				curStepH := stepH
+				cmdRight := cmdTopEdgeRight
+				cmdLeft := cmdTopEdgeLeft
+				configMu.RUnlock()
+
 				if !t.hasX0 {
 					t.x0 = ev.Value
 					t.hasX0 = true
-				} else if absInt32(ev.Value-t.x0) > maxTapMove {
+				} else if absInt32(ev.Value-t.x0) > curMaxTapMove {
 					tapMoved = true
 				}
 				decideZone(t, maxX, maxY)
 				if t.zone == ZoneTop && t.hasLast {
 					t.acc += float64(ev.Value) - t.last
 					t.last = float64(ev.Value)
-					for math.Abs(t.acc) >= stepH {
+					for math.Abs(t.acc) >= curStepH {
 						if t.acc > 0 {
-							spawn(cmdTopEdgeRight)
-							t.acc -= stepH
+							spawn(cmdRight)
+							t.acc -= curStepH
 						} else {
-							spawn(cmdTopEdgeLeft)
-							t.acc += stepH
+							spawn(cmdLeft)
+							t.acc += curStepH
 						}
 					}
 				}
@@ -535,32 +534,41 @@ func main() {
 				if !ok {
 					break
 				}
+				configMu.RLock()
+				curMaxTapMove := maxTapMove
+				curStep := step
+				leftUp := cmdLeftEdgeUp
+				leftDown := cmdLeftEdgeDown
+				rightUp := cmdRightEdgeUp
+				rightDown := cmdRightEdgeDown
+				configMu.RUnlock()
+
 				if !t.hasY0 {
 					t.y0 = ev.Value
 					t.hasY0 = true
-				} else if absInt32(ev.Value-t.y0) > maxTapMove {
+				} else if absInt32(ev.Value-t.y0) > curMaxTapMove {
 					tapMoved = true
 				}
 				decideZone(t, maxX, maxY)
 				if (t.zone == ZoneLeft || t.zone == ZoneRight) && t.hasLast {
 					t.acc += t.last - float64(ev.Value)
 					t.last = float64(ev.Value)
-					for math.Abs(t.acc) >= step {
+					for math.Abs(t.acc) >= curStep {
 						if t.zone == ZoneLeft {
 							if t.acc > 0 {
-								spawn(cmdLeftEdgeUp)
-								t.acc -= step
+								spawn(leftUp)
+								t.acc -= curStep
 							} else {
-								spawn(cmdLeftEdgeDown)
-								t.acc += step
+								spawn(leftDown)
+								t.acc += curStep
 							}
 						} else {
 							if t.acc > 0 {
-								spawn(cmdRightEdgeUp)
-								t.acc -= step
+								spawn(rightUp)
+								t.acc -= curStep
 							} else {
-								spawn(cmdRightEdgeDown)
-								t.acc += step
+								spawn(rightDown)
+								t.acc += curStep
 							}
 						}
 					}
@@ -576,8 +584,13 @@ func main() {
 					tapPeak = 0
 					tapMoved = false
 				} else if hasTap {
-					if (now-tapStart) < maxTapTime && !tapMoved {
-						if cmd, ok := taps[tapPeak]; ok {
+					configMu.RLock()
+					curMaxTapTime := maxTapTime
+					cmd, ok := taps[tapPeak]
+					configMu.RUnlock()
+
+					if (now-tapStart) < curMaxTapTime && !tapMoved {
+						if ok {
 							spawn(cmd)
 						}
 					}
