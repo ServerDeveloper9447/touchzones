@@ -1,0 +1,19 @@
+# Default config file for touchzones
+# Gesture thresholds
+edge = 0.06
+top_edge = 0.08
+step = 0.03
+max_tap_time = 0.25
+max_tap_move = 120
+
+# Sliders
+left_up = brightnessctl -q set 3%+
+left_down = brightnessctl -q -n1 set 3%-
+right_up = wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+
+right_down = wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-
+top_right =
+top_left =
+
+# Tap actions
+tap_4 =
+tap_5 =
