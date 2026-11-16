@@ -283,7 +283,7 @@ func loadConfig(path string) error {
 			}
 
 		case "max_tap_move":
-			if v, err := strconv.Atoi(val); err == nil {
+			if v, err := strconv.ParseInt(val, 10, 32); err == nil {
 				maxTapMove = int32(v)
 			}
 
