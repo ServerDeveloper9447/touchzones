@@ -11,8 +11,9 @@ It reads raw `evdev` multi-touch events directly, with zero desktop environment 
 - **Right edge**: Swipe up/down to adjust volume (`wpctl`).
 - **Left edge**: Swipe up/down to adjust brightness (`brightnessctl`).
 - **Top edge**: Swipe left/right for workspace switching (`hyprctl dispatch workspace`).
+- **1-finger edge taps & double taps**: Tap or double-tap on any edge (left, right, top) for discrete shortcuts (e.g. mute volume, toggle brightness/night-light, app switch).
 - **4 & 5 finger taps**: Quick tap shortcuts (e.g. notifications, app launch).
-- **Multi-touch protection**: If 2 or more fingers touch down anywhere (e.g. while two-finger scrolling), edge sliders are disabled so you don't accidentally change volume or brightness.
+- **Multi-touch protection**: If 2 or more fingers touch down anywhere (e.g. while two-finger scrolling), edge sliders and edge taps are disabled so you don't accidentally trigger commands.
 
 ---
 
@@ -140,6 +141,7 @@ top_edge = 0.08      # Top edge zone height
 step = 0.03          # Distance required to trigger one slider tick
 max_tap_time = 0.25  # Max duration (in seconds) to count as a tap
 max_tap_move = 120   # Movement tolerance before a tap is cancelled
+max_double_tap_time = 0.30  # Max delay (in seconds) between taps for double tap
 
 # Slider commands
 left_up    = brightnessctl -q set 3%+
@@ -149,10 +151,20 @@ right_down = wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-
 top_right  = hyprctl dispatch workspace e+1
 top_left   = hyprctl dispatch workspace e-1
 
-# Tap actions
+# Tap actions (multi-finger)
 tap_4 = notify-send "4-finger tap"
 tap_5 = notify-send "5-finger tap"
+
+# Edge tap actions (1 finger)
+left_tap =
+left_double_tap =
+right_tap = wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+right_double_tap =
+top_tap =
+top_double_tap =
 ```
+
+> **Note on Double Taps**: If a `*_double_tap` command is configured for an edge, a single tap on that edge will wait up to `max_double_tap_time` before firing so that double taps trigger cleanly without accidental single taps. If no double tap is configured for that edge, the single tap triggers immediately on release.
 
 Leave any action empty if you don't want it bound to anything:
 ```ini

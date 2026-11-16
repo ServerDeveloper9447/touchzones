@@ -21,6 +21,7 @@ import (
 	"sync"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/holoplot/go-evdev"
 )
@@ -33,6 +34,7 @@ var (
 	edge             = 0.06
 	topEdge          = 0.08
 	maxTapTime       = 0.25 // seconds
+	maxDoubleTapTime = 0.30 // seconds
 	maxTapMove int32 = 120  // position delta
 	stepFactor       = 0.03
 )
@@ -66,6 +68,13 @@ var (
 	cmdTopEdgeLeft   []string
 	cmdTopEdgeRight  []string
 
+	cmdLeftTap        []string
+	cmdLeftDoubleTap  []string
+	cmdRightTap       []string
+	cmdRightDoubleTap []string
+	cmdTopTap         []string
+	cmdTopDoubleTap   []string
+
 	taps = map[int][]string{
 		4: {},
 		5: {},
@@ -84,6 +93,139 @@ var (
 
 	homeDir = cmp.Or(os.Getenv("XDG_CONFIG_HOME"), os.Getenv("HOME"))
 )
+
+func getSingleTapCmd(zone Zone) []string {
+	switch zone {
+	case ZoneLeft:
+		return cmdLeftTap
+	case ZoneRight:
+		return cmdRightTap
+	case ZoneTop:
+		return cmdTopTap
+	default:
+		return nil
+	}
+}
+
+func getDoubleTapCmd(zone Zone) []string {
+	switch zone {
+	case ZoneLeft:
+		return cmdLeftDoubleTap
+	case ZoneRight:
+		return cmdRightDoubleTap
+	case ZoneTop:
+		return cmdTopDoubleTap
+	default:
+		return nil
+	}
+}
+
+type EdgeTapDetector struct {
+	mu           sync.Mutex
+	pendingZone  Zone
+	pendingTimer *time.Timer
+	lastTapTime  float64
+	spawner      func([]string)
+}
+
+func newEdgeTapDetector(spawner func([]string)) *EdgeTapDetector {
+	if spawner == nil {
+		spawner = spawn
+	}
+	return &EdgeTapDetector{
+		spawner: spawner,
+	}
+}
+
+func (d *EdgeTapDetector) cancelPendingLocked() {
+	if d.pendingTimer != nil {
+		d.pendingTimer.Stop()
+		d.pendingTimer = nil
+	}
+	d.pendingZone = ZoneNone
+}
+
+func (d *EdgeTapDetector) flushPendingLocked() {
+	if d.pendingTimer != nil {
+		d.pendingTimer.Stop()
+		d.pendingTimer = nil
+	}
+	zone := d.pendingZone
+	d.pendingZone = ZoneNone
+	if zone != ZoneNone {
+		configMu.RLock()
+		cmd := getSingleTapCmd(zone)
+		configMu.RUnlock()
+		if len(cmd) > 0 {
+			d.spawner(cmd)
+		}
+	}
+}
+
+func (d *EdgeTapDetector) FlushPending() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.flushPendingLocked()
+}
+
+func (d *EdgeTapDetector) Reset() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.cancelPendingLocked()
+	d.lastTapTime = 0
+}
+
+func (d *EdgeTapDetector) HandleTap(zone Zone, now float64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	configMu.RLock()
+	doubleCmd := getDoubleTapCmd(zone)
+	singleCmd := getSingleTapCmd(zone)
+	curMaxDoubleTime := maxDoubleTapTime
+	configMu.RUnlock()
+
+	// If no double tap command is configured, fire single tap immediately
+	if len(doubleCmd) == 0 {
+		if d.pendingZone != ZoneNone {
+			d.flushPendingLocked()
+		}
+		if len(singleCmd) > 0 {
+			d.spawner(singleCmd)
+		}
+		return
+	}
+
+	// If there is an active pending tap in the same zone within maxDoubleTapTime: Double Tap!
+	if d.pendingZone == zone && (now-d.lastTapTime) <= curMaxDoubleTime {
+		d.cancelPendingLocked()
+		d.spawner(doubleCmd)
+		return
+	}
+
+	// Flush any existing pending tap before starting a new one
+	if d.pendingZone != ZoneNone {
+		d.flushPendingLocked()
+	}
+
+	// Start pending timer for single tap while waiting for potential double tap
+	d.pendingZone = zone
+	d.lastTapTime = now
+	d.pendingTimer = time.AfterFunc(time.Duration(curMaxDoubleTime*float64(time.Second)), func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.pendingZone == zone {
+			d.pendingZone = ZoneNone
+			d.pendingTimer = nil
+			configMu.RLock()
+			cmd := getSingleTapCmd(zone)
+			configMu.RUnlock()
+			if len(cmd) > 0 {
+				d.spawner(cmd)
+			}
+		}
+	})
+}
 
 func init() {
 	if runtime.GOOS != "linux" {
@@ -281,6 +423,10 @@ func loadConfig(path string) error {
 			if v, err := strconv.ParseFloat(val, 64); err == nil {
 				maxTapTime = v
 			}
+		case "max_double_tap_time":
+			if v, err := strconv.ParseFloat(val, 64); err == nil {
+				maxDoubleTapTime = v
+			}
 
 		case "max_tap_move":
 			if v, err := strconv.ParseInt(val, 10, 32); err == nil {
@@ -309,6 +455,19 @@ func loadConfig(path string) error {
 			taps[4] = parseCmd(val)
 		case "tap_5":
 			taps[5] = parseCmd(val)
+
+		case "left_tap":
+			cmdLeftTap = parseCmd(val)
+		case "left_double_tap":
+			cmdLeftDoubleTap = parseCmd(val)
+		case "right_tap":
+			cmdRightTap = parseCmd(val)
+		case "right_double_tap":
+			cmdRightDoubleTap = parseCmd(val)
+		case "top_tap":
+			cmdTopTap = parseCmd(val)
+		case "top_double_tap":
+			cmdTopDoubleTap = parseCmd(val)
 		}
 	}
 	if err := scn.Err(); err != nil {
@@ -433,6 +592,8 @@ func main() {
 	stepH = maxX * stepFactor
 	configMu.Unlock()
 
+	edgeTapDetector := newEdgeTapDetector(spawn)
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
@@ -450,6 +611,7 @@ func main() {
 				configMu.Unlock()
 				log.Println("[INFO] Configuration reloaded successfully")
 			case os.Interrupt, syscall.SIGTERM:
+				edgeTapDetector.Reset()
 				dev.Close()
 				lockFile.Close()
 				os.Exit(0)
@@ -461,10 +623,13 @@ func main() {
 	touches := make(map[int32]*Touch)
 
 	var (
-		tapStart float64
-		hasTap   bool
-		tapPeak  int
-		tapMoved bool
+		tapStart         float64
+		hasTap           bool
+		tapPeak          int
+		tapMoved         bool
+		sliderFired      bool
+		maxActiveTouches int
+		lastTouchZone    Zone = ZoneUndecided
 	)
 
 	for {
@@ -484,12 +649,19 @@ func main() {
 
 			case evdev.ABS_MT_TRACKING_ID:
 				if ev.Value == -1 {
+					if t, ok := touches[slot]; ok {
+						lastTouchZone = t.zone
+					}
 					delete(touches, slot)
 				} else {
 					touches[slot] = &Touch{
 						zone: ZoneUndecided,
 					}
+					if len(touches) > maxActiveTouches {
+						maxActiveTouches = len(touches)
+					}
 					if len(touches) > 1 {
+						lastTouchZone = ZoneNone
 						for _, t := range touches {
 							t.zone = ZoneNone
 						}
@@ -513,12 +685,18 @@ func main() {
 					t.hasX0 = true
 				} else if absInt32(ev.Value-t.x0) > curMaxTapMove {
 					tapMoved = true
+					edgeTapDetector.FlushPending()
 				}
 				decideZone(t, maxX, maxY)
+				if maxActiveTouches <= 1 && t.zone != ZoneUndecided {
+					lastTouchZone = t.zone
+				}
 				if t.zone == ZoneTop && t.hasLast {
 					t.acc += float64(ev.Value) - t.last
 					t.last = float64(ev.Value)
 					for math.Abs(t.acc) >= curStepH {
+						sliderFired = true
+						edgeTapDetector.FlushPending()
 						if t.acc > 0 {
 							spawn(cmdRight)
 							t.acc -= curStepH
@@ -548,12 +726,18 @@ func main() {
 					t.hasY0 = true
 				} else if absInt32(ev.Value-t.y0) > curMaxTapMove {
 					tapMoved = true
+					edgeTapDetector.FlushPending()
 				}
 				decideZone(t, maxX, maxY)
+				if maxActiveTouches <= 1 && t.zone != ZoneUndecided {
+					lastTouchZone = t.zone
+				}
 				if (t.zone == ZoneLeft || t.zone == ZoneRight) && t.hasLast {
 					t.acc += t.last - float64(ev.Value)
 					t.last = float64(ev.Value)
 					for math.Abs(t.acc) >= curStep {
+						sliderFired = true
+						edgeTapDetector.FlushPending()
 						if t.zone == ZoneLeft {
 							if t.acc > 0 {
 								spawn(leftUp)
@@ -583,15 +767,29 @@ func main() {
 					hasTap = true
 					tapPeak = 0
 					tapMoved = false
+					sliderFired = false
+					maxActiveTouches = len(touches)
+					lastTouchZone = ZoneUndecided
 				} else if hasTap {
 					configMu.RLock()
 					curMaxTapTime := maxTapTime
 					cmd, ok := taps[tapPeak]
 					configMu.RUnlock()
 
-					if (now-tapStart) < curMaxTapTime && !tapMoved {
-						if ok {
+					if (now-tapStart) < curMaxTapTime && !tapMoved && !sliderFired {
+						if ok && len(cmd) > 0 {
 							spawn(cmd)
+						} else if (tapPeak == 1 || tapPeak == 0) && maxActiveTouches <= 1 {
+							z := lastTouchZone
+							if z == ZoneUndecided && len(touches) == 1 {
+								for _, t := range touches {
+									z = t.zone
+									break
+								}
+							}
+							if z == ZoneLeft || z == ZoneRight || z == ZoneTop {
+								edgeTapDetector.HandleTap(z, now)
+							}
 						}
 					}
 					hasTap = false
@@ -600,6 +798,12 @@ func main() {
 				if count, ok := fingerCodes[ev.Code]; ok {
 					if count > tapPeak {
 						tapPeak = count
+					}
+					if count > maxActiveTouches {
+						maxActiveTouches = count
+					}
+					if count > 1 {
+						lastTouchZone = ZoneNone
 					}
 				}
 			}

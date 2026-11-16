@@ -4,7 +4,11 @@ package main
 
 import (
 	"math"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 )
 
 func TestDecideZone(t *testing.T) {
@@ -169,6 +173,65 @@ func TestTapConditions(t *testing.T) {
 	}
 }
 
+func TestEdgeTapConditions(t *testing.T) {
+	evalEdgeTap := func(now, tapStart, curMaxTapTime float64, tapMoved, sliderFired bool, tapPeak, maxActiveTouches int, zone Zone) bool {
+		return (now-tapStart) < curMaxTapTime && !tapMoved && !sliderFired && (tapPeak == 1 || tapPeak == 0) && maxActiveTouches <= 1 && (zone == ZoneLeft || zone == ZoneRight || zone == ZoneTop)
+	}
+
+	start := 10.0
+	curMaxTapTime := 0.25
+
+	// Valid 1-finger left edge tap
+	if !evalEdgeTap(10.15, start, curMaxTapTime, false, false, 1, 1, ZoneLeft) {
+		t.Fatalf("expected left edge tap to pass")
+	}
+
+	// Valid 1-finger right edge tap
+	if !evalEdgeTap(10.15, start, curMaxTapTime, false, false, 1, 1, ZoneRight) {
+		t.Fatalf("expected right edge tap to pass")
+	}
+
+	// Valid 1-finger top edge tap
+	if !evalEdgeTap(10.15, start, curMaxTapTime, false, false, 1, 1, ZoneTop) {
+		t.Fatalf("expected top edge tap to pass")
+	}
+
+	// Zone None (center of touchpad) -> suppressed
+	if evalEdgeTap(10.15, start, curMaxTapTime, false, false, 1, 1, ZoneNone) {
+		t.Fatalf("center zone should be suppressed")
+	}
+
+	// Zone Undecided -> suppressed
+	if evalEdgeTap(10.15, start, curMaxTapTime, false, false, 1, 1, ZoneUndecided) {
+		t.Fatalf("undecided zone should be suppressed")
+	}
+
+	// Tap moved -> suppressed
+	if evalEdgeTap(10.15, start, curMaxTapTime, true, false, 1, 1, ZoneLeft) {
+		t.Fatalf("moved tap should be suppressed")
+	}
+
+	// Slider fired -> suppressed
+	if evalEdgeTap(10.15, start, curMaxTapTime, false, true, 1, 1, ZoneLeft) {
+		t.Fatalf("slider fired tap should be suppressed")
+	}
+
+	// Duration exceeded -> suppressed
+	if evalEdgeTap(10.30, start, curMaxTapTime, false, false, 1, 1, ZoneLeft) {
+		t.Fatalf("slow tap should be suppressed")
+	}
+
+	// Multi-finger by peak -> suppressed
+	if evalEdgeTap(10.15, start, curMaxTapTime, false, false, 2, 1, ZoneLeft) {
+		t.Fatalf("multi-finger peak should be suppressed")
+	}
+
+	// Multi-finger by active touches -> suppressed
+	if evalEdgeTap(10.15, start, curMaxTapTime, false, false, 1, 2, ZoneLeft) {
+		t.Fatalf("multi active touches should be suppressed")
+	}
+}
+
 func TestParseCmd(t *testing.T) {
 	tests := []struct {
 		input    string
@@ -253,5 +316,254 @@ func TestKillRunningDaemonNotRunning(t *testing.T) {
 		t.Fatalf("expected error when no lock file exists, got nil")
 	}
 }
+
+func TestLoadConfigEdgeTaps(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "touchzones.conf")
+	content := `
+max_double_tap_time = 0.20
+left_tap = notify-send "left tap"
+left_double_tap = notify-send "left double tap"
+right_tap = wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+right_double_tap = notify-send "right double tap"
+top_tap = notify-send "top tap"
+top_double_tap = notify-send "top double tap"
+`
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	if err := loadConfig(cfgPath); err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+
+	configMu.RLock()
+	defer configMu.RUnlock()
+
+	if maxDoubleTapTime != 0.20 {
+		t.Errorf("expected maxDoubleTapTime 0.20, got %f", maxDoubleTapTime)
+	}
+	if !reflect.DeepEqual(cmdLeftTap, []string{"notify-send", "left tap"}) {
+		t.Errorf("unexpected cmdLeftTap: %v", cmdLeftTap)
+	}
+	if !reflect.DeepEqual(cmdLeftDoubleTap, []string{"notify-send", "left double tap"}) {
+		t.Errorf("unexpected cmdLeftDoubleTap: %v", cmdLeftDoubleTap)
+	}
+	if !reflect.DeepEqual(cmdRightTap, []string{"wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"}) {
+		t.Errorf("unexpected cmdRightTap: %v", cmdRightTap)
+	}
+	if !reflect.DeepEqual(cmdRightDoubleTap, []string{"notify-send", "right double tap"}) {
+		t.Errorf("unexpected cmdRightDoubleTap: %v", cmdRightDoubleTap)
+	}
+	if !reflect.DeepEqual(cmdTopTap, []string{"notify-send", "top tap"}) {
+		t.Errorf("unexpected cmdTopTap: %v", cmdTopTap)
+	}
+	if !reflect.DeepEqual(cmdTopDoubleTap, []string{"notify-send", "top double tap"}) {
+		t.Errorf("unexpected cmdTopDoubleTap: %v", cmdTopDoubleTap)
+	}
+}
+
+func TestEdgeTapDetectorImmediate(t *testing.T) {
+	configMu.Lock()
+	cmdLeftTap = []string{"left_single"}
+	cmdLeftDoubleTap = nil
+	configMu.Unlock()
+
+	ch := make(chan []string, 10)
+	detector := newEdgeTapDetector(func(args []string) {
+		ch <- args
+	})
+	defer detector.Reset()
+
+	detector.HandleTap(ZoneLeft, 10.0)
+
+	select {
+	case cmd := <-ch:
+		if !reflect.DeepEqual(cmd, []string{"left_single"}) {
+			t.Fatalf("expected left_single, got %v", cmd)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("timed out waiting for immediate single tap")
+	}
+}
+
+func TestEdgeTapDetectorDoubleTap(t *testing.T) {
+	configMu.Lock()
+	cmdLeftTap = []string{"left_single"}
+	cmdLeftDoubleTap = []string{"left_double"}
+	maxDoubleTapTime = 0.15
+	configMu.Unlock()
+
+	ch := make(chan []string, 10)
+	detector := newEdgeTapDetector(func(args []string) {
+		ch <- args
+	})
+	defer detector.Reset()
+
+	// First tap at t=10.0
+	detector.HandleTap(ZoneLeft, 10.0)
+
+	// Second tap at t=10.05 (within 0.15s window)
+	detector.HandleTap(ZoneLeft, 10.05)
+
+	select {
+	case cmd := <-ch:
+		if !reflect.DeepEqual(cmd, []string{"left_double"}) {
+			t.Fatalf("expected left_double, got %v", cmd)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for double tap")
+	}
+
+	// Ensure single tap never arrives
+	select {
+	case cmd := <-ch:
+		t.Fatalf("unexpected command arrived: %v", cmd)
+	case <-time.After(200 * time.Millisecond):
+		// Success: single tap was cancelled
+	}
+}
+
+func TestEdgeTapDetectorSingleTapDelayed(t *testing.T) {
+	configMu.Lock()
+	cmdRightTap = []string{"right_single"}
+	cmdRightDoubleTap = []string{"right_double"}
+	maxDoubleTapTime = 0.05
+	configMu.Unlock()
+
+	ch := make(chan []string, 10)
+	detector := newEdgeTapDetector(func(args []string) {
+		ch <- args
+	})
+	defer detector.Reset()
+
+	detector.HandleTap(ZoneRight, 10.0)
+
+	// It should NOT arrive immediately
+	select {
+	case cmd := <-ch:
+		t.Fatalf("command fired too early: %v", cmd)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// It should arrive after the timeout
+	select {
+	case cmd := <-ch:
+		if !reflect.DeepEqual(cmd, []string{"right_single"}) {
+			t.Fatalf("expected right_single, got %v", cmd)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for delayed single tap")
+	}
+}
+
+func TestEdgeTapDetectorZoneSwitch(t *testing.T) {
+	configMu.Lock()
+	cmdLeftTap = []string{"left_single"}
+	cmdLeftDoubleTap = []string{"left_double"}
+	cmdRightTap = []string{"right_single"}
+	cmdRightDoubleTap = nil
+	maxDoubleTapTime = 0.20
+	configMu.Unlock()
+
+	ch := make(chan []string, 10)
+	detector := newEdgeTapDetector(func(args []string) {
+		ch <- args
+	})
+	defer detector.Reset()
+
+	// Tap left
+	detector.HandleTap(ZoneLeft, 10.0)
+
+	// Tap right immediately
+	detector.HandleTap(ZoneRight, 10.02)
+
+	// Both left_single (flushed) and right_single (immediate because no right_double_tap) should arrive
+	received := make([][]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		select {
+		case cmd := <-ch:
+			received = append(received, cmd)
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("timed out waiting for commands, got %v", received)
+		}
+	}
+
+	if !reflect.DeepEqual(received[0], []string{"left_single"}) {
+		t.Errorf("expected first cmd left_single, got %v", received[0])
+	}
+	if !reflect.DeepEqual(received[1], []string{"right_single"}) {
+		t.Errorf("expected second cmd right_single, got %v", received[1])
+	}
+}
+
+func TestEdgeTapDetectorFlushPending(t *testing.T) {
+	configMu.Lock()
+	cmdTopTap = []string{"top_single"}
+	cmdTopDoubleTap = []string{"top_double"}
+	maxDoubleTapTime = 0.20
+	configMu.Unlock()
+
+	ch := make(chan []string, 10)
+	detector := newEdgeTapDetector(func(args []string) {
+		ch <- args
+	})
+	defer detector.Reset()
+
+	detector.HandleTap(ZoneTop, 10.0)
+	detector.FlushPending()
+
+	select {
+	case cmd := <-ch:
+		if !reflect.DeepEqual(cmd, []string{"top_single"}) {
+			t.Fatalf("expected top_single, got %v", cmd)
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("timed out waiting for flushed single tap")
+	}
+}
+
+func TestEdgeTapDetectorSameZoneExpired(t *testing.T) {
+	configMu.Lock()
+	cmdLeftTap = []string{"left_single"}
+	cmdLeftDoubleTap = []string{"left_double"}
+	maxDoubleTapTime = 0.15
+	configMu.Unlock()
+
+	ch := make(chan []string, 10)
+	detector := newEdgeTapDetector(func(args []string) {
+		ch <- args
+	})
+	defer detector.Reset()
+
+	// Tap 1 at t=10.0
+	detector.HandleTap(ZoneLeft, 10.0)
+
+	// Tap 2 at t=10.25 (exceeds 0.15s window) -> should flush Tap 1 as single tap
+	detector.HandleTap(ZoneLeft, 10.25)
+
+	select {
+	case cmd := <-ch:
+		if !reflect.DeepEqual(cmd, []string{"left_single"}) {
+			t.Fatalf("expected flushed left_single, got %v", cmd)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for flushed single tap")
+	}
+
+	// Tap 3 at t=10.30 (50ms after Tap 2) -> should register double tap with Tap 2
+	detector.HandleTap(ZoneLeft, 10.30)
+
+	select {
+	case cmd := <-ch:
+		if !reflect.DeepEqual(cmd, []string{"left_double"}) {
+			t.Fatalf("expected left_double, got %v", cmd)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("timed out waiting for double tap")
+	}
+}
+
+
 
 
