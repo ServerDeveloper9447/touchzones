@@ -26,7 +26,7 @@ import (
 	"github.com/holoplot/go-evdev"
 )
 
-const version = "1.0.0"
+const version = "1.2.0"
 
 var (
 	configMu sync.RWMutex
